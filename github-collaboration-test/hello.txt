@@ -1,2 +1,0 @@
-Hello GitHub!
-This file was created by Codex to test collaboration in this repository.
