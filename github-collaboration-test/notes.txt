@@ -1,0 +1,2 @@
+GitHub collaboration test
+This folder contains two text files for a local commit and push test.
