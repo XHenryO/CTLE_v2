@@ -80,12 +80,12 @@ for i in range(1):
     # name of file
     path = './channel/'
     # name_Tx = ['./Txdata_NN_baseline', '.txt']
-    name_Tx = ['D:/CTLE_v2/data/Txdata_NN_baseline_wgn', '.txt']     ## 瀵煎叆鏂囦欢鐨勫悕绉?
+    name_Tx = ['D:/git_CTLE/CTLE_v2/data/Txdata_NN_baseline_wgn', '.txt']     ## 瀵煎叆鏂囦欢鐨勫悕绉?
     # name_Tx = ['./MLP_tx', Extra, '.txt']
     name_Tx = ''.join(name_Tx)
     # name_Rx = ['./MLP_rx', Extra, '.txt']
     # name_Rx = ['./Rxdata_NN_baseline', '.txt']
-    name_Rx = ['D:/CTLE_v2/data/Rxdata_NN_baseline_wgn', '.txt']
+    name_Rx = ['D:/git_CTLE/CTLE_v2/data/Rxdata_NN_baseline_wgn', '.txt']
     name_Rx = ''.join(name_Rx)
     # name_Sa = ['Rxdata_after', str(Extra), '.txt']
     name_Sa = [ExtraFlag, '_afterNN', '.txt']
@@ -160,7 +160,9 @@ for i in range(1):
     EarlyStop = EarlyStopping(monitor='val_mse', min_delta=0.00000000001,
                               patience=epoch * 0.5, verbose=1, mode='auto')
 
-    Check_point = ModelCheckpoint(filepath="./NN/forEpoch/model_{epoch:02d}.weights.h5", save_weights_only=True)
+    Check_point = ModelCheckpoint(filepath="./NN/forEpoch/model_{epoch:02d}.weights.h5", save_weights_only=True,
+    monitor="val_mse",
+    save_best_only=True,)
 
 
 

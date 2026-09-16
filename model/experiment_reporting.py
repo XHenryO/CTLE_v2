@@ -49,20 +49,20 @@ def report_experiment_result(
         ("gd_100k_25g_ps", 25.0e9),
         ("gd_100k_50g_ps", 50.0e9),
     )
-    group_delays = {}
-    for field_name, upper_frequency in bands:
-        value = maximum_link_group_delay_ps(
-            model,
-            layer_names,
-            Fs,
-            f_min=100e3,
-            f_max=upper_frequency,
-        )
-        group_delays[field_name] = value
-        print(
-            "Maximum channel + equalizer group delay "
-            f"(100 kHz to {upper_frequency / 1e9:g} GHz) = {value} ps"
-        )
+    # group_delays = {}
+    # for field_name, upper_frequency in bands:
+    #     value = maximum_link_group_delay_ps(
+    #         model,
+    #         layer_names,
+    #         Fs,
+    #         f_min=100e3,
+    #         f_max=upper_frequency,
+    #     )
+    #     group_delays[field_name] = value
+    #     print(
+    #         "Maximum channel + equalizer group delay "
+    #         f"(100 kHz to {upper_frequency / 1e9:g} GHz) = {value} ps"
+    #     )
 
     result = {
         "model": str(model_name),
@@ -71,7 +71,8 @@ def report_experiment_result(
         "train_ber": float(train_ber),
         "test_mse": float(test_mse),
         "test_ber": float(test_ber),
-        **group_delays,
+
     }
+    # ** group_delays,
     print(RESULT_PREFIX + json.dumps(result, sort_keys=True))
     return result

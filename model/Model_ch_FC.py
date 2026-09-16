@@ -4,6 +4,7 @@ from tensorflow import keras
 from SelfDesign import MyLayer, MyLayer2
 from tensorflow.keras.layers import Conv1D
 
+import inspect
 import os
 import random
 
@@ -23,6 +24,13 @@ os.environ["PYTHONHASHSEED"] = str(SEED)
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+
+
+def load_saved_model(filepath, **kwargs):
+    """Load local experiment models with either legacy or newer Keras."""
+    if "safe_mode" in inspect.signature(keras.models.load_model).parameters:
+        kwargs["safe_mode"] = False
+    return keras.models.load_model(filepath, **kwargs)
 
 
 def normalize_rms(data, eps=1e-12):
@@ -162,7 +170,10 @@ def channel_take_center(x):
 
 
 def channel_restore_waveform(inputs):
-    x, ref = inputs
+    # Avoid UNPACK_SEQUENCE bytecode: Keras 2.10's Windows Lambda serializer
+    # replaces byte 0x5c, which is this opcode in Python 3.9.
+    x = inputs[0]
+    ref = inputs[1]
     return tf.reshape(x, [tf.shape(ref)[0], tf.shape(ref)[1]])
 
 
@@ -196,7 +207,8 @@ def save_before_downsample_probe(model, data, label):
     )
     before_downsample = probe_model.predict(data, batch_size=batch_size)
     model_name = os.path.splitext(os.path.basename(model_file))[0]
-    np.savetxt(path + model_name + "_" + label + "_before_downsample.txt", before_downsample.reshape(-1), fmt="%1.7e")
+    waveform_file = os.path.join(waveforms_dir, model_name + "_" + label + "_before_downsample.txt")
+    np.savetxt(waveform_file, before_downsample.reshape(-1), fmt="%1.7e")
     print(label, "probe offset =", get_model_offset(model))
 
 
@@ -246,31 +258,38 @@ snr = configured_snr(15)
 snr_tag = "snr" + str(snr)
 offset_candidates = list(range(sps))
 # ffe_kernel_size = int(os.environ.get("CTLE_FFE_KERNEL_SIZE", "17"))
-ffe_kernel_size = 3
+ffe_kernel_size = 9
 # if ffe_kernel_size < 3 or ffe_kernel_size % 2 == 0:
 #     raise ValueError("CTLE_FFE_KERNEL_SIZE must be an odd integer >= 3")
 tap_tag = "tap" + str(ffe_kernel_size)
-path = "data_model/"
-name_Tx = "./data/Txdata.txt"
-channel_path = "channel/"
+# Resolve input and output paths relative to this script.
+output_root = os.path.dirname(os.path.abspath(__file__))
+name_Tx = os.path.join(os.path.dirname(output_root), "data", "Txdata.txt")
+channel_file = os.path.join(output_root, "channel", "DNN_channelest_TTHNet_SinM.h5")
 channel_in_taps = 157
 channel_output_dim = 85
-# model_file = path + "iir_fc_nn_channel_model.keras"
-# final_weights_file = path + "iir_fc_nn_channel_final.weights.h5"
-model_file = path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_model.keras"
-final_weights_file = path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_final.weights.h5"
+experiment_name = "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag
+models_dir = os.path.join(output_root, "model_trained")
+offset_models_dir = os.path.join(models_dir, experiment_name + "_offsets")
+weights_dir = os.path.join(output_root, "model_weights", experiment_name)
+results_dir = os.path.join(output_root, "result")
+waveforms_dir = os.path.join(results_dir, experiment_name + "_waveforms")
 
-os.makedirs(path, exist_ok=True)
+model_file = os.path.join(models_dir, experiment_name + "_model.keras")
+final_weights_file = os.path.join(weights_dir, experiment_name + "_final.weights.h5")
+offset_results_file = os.path.join(results_dir, experiment_name + "_offset_results.txt")
 
-channel = keras.models.load_model(
-    channel_path + "DNN_" + "channelest_TTHNet_Sin" + ".h5",
+for output_dir in (models_dir, offset_models_dir, weights_dir, results_dir, waveforms_dir):
+    os.makedirs(output_dir, exist_ok=True)
+
+channel = load_saved_model(
+    channel_file,
     custom_objects={
         "MyLayer": MyLayer,
         "MyLayer2": MyLayer2,
         "time_steps": channel_in_taps,
     },
     compile=False,
-    safe_mode=False,
 )
 channel.trainable = False
 
@@ -296,7 +315,6 @@ y_test = to_symbol_batch(y_test)
 
 def build_model(current_offset):
     NNinput = Input(shape=(None,), name="tx_input")
-
 
     data_upsampled = Lambda(repeat_upsample_tensor, arguments={"sps": sps}, name="tx_upsampling")(NNinput)
 
@@ -336,15 +354,19 @@ def build_model(current_offset):
     #     Fs=Fs,
     #     name="rx_ctle",
     # )(data_ch)
-    data_CTLE = CTLELayer_model_v12_v4(
+    # data_CTLE = CTLELayer_model_v12_v4(
+    #     Fs=Fs,
+    #     prewarp_frequency_hz=Rs / 2.0,
+    #     name="rx_ctle",
+    # )(data_ch)
+    data_CTLE = CTLELayer4(
         Fs=Fs,
-        prewarp_frequency_hz=Rs / 2.0,
         name="rx_ctle",
     )(data_ch)
-    data_CTLE = tf.keras.layers.Rescaling(
-        scale=-1.0,
-        name="rx_ctle_polarity_compensation",
-    )(data_CTLE)
+    # data_CTLE = tf.keras.layers.Rescaling(
+    #     scale=-1.0,
+    #     name="rx_ctle_polarity_compensation",
+    # )(data_CTLE)
     data_symbol = Lambda(
         downsample_tensor,
         arguments={"sps": sps, "offset": current_offset},
@@ -368,12 +390,10 @@ if retrain:
         np.random.seed(SEED)
         tf.random.set_seed(SEED)
 
-        # current_model_file = path + "iir_fc_nn_channel_offset" + str(current_offset) + ".keras"
-        # current_final_weights_file = path + "iir_fc_nn_channel_offset" + str(current_offset) + "_final.weights.h5"
-        # current_best_weights_file = path + "iir_fc_nn_channel_offset" + str(current_offset) + "_best.weights.h5"
-        current_model_file = path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_offset" + str(current_offset) + ".keras"
-        current_final_weights_file = path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_offset" + str(current_offset) + "_final.weights.h5"
-        current_best_weights_file = path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_offset" + str(current_offset) + "_best.weights.h5"
+        offset_name = experiment_name + "_offset" + str(current_offset)
+        current_model_file = os.path.join(offset_models_dir, offset_name + ".keras")
+        current_final_weights_file = os.path.join(weights_dir, offset_name + "_final.weights.h5")
+        current_best_weights_file = os.path.join(weights_dir, offset_name + "_best.weights.h5")
 
         model = build_model(current_offset)
         model.summary()
@@ -428,7 +448,7 @@ if retrain:
         offset_results,
         key=lambda item: item[1],
     )
-    model = tf.keras.models.load_model(
+    model = load_saved_model(
         best_model_file,
         custom_objects={
             "CTLELayer2": CTLELayer2,
@@ -455,23 +475,20 @@ if retrain:
             "channel_take_center": channel_take_center,
             "channel_restore_waveform": channel_restore_waveform,
         },
-        safe_mode=False,
     )
     model.save_weights(final_weights_file)
     model.save(model_file)
     np.savetxt(
-        path + "repeat_fc_nn_channel_" + snr_tag + "_" + tap_tag + "_offset_results.txt",
+        offset_results_file,
         np.array([[item[0], item[1], item[2]] for item in offset_results], dtype=np.float64),
         fmt="%1.7e",
         header="offset val_mse val_ber",
     )
     print("best offset =", best_offset, "best val MSE =", best_mse, "best val BER =", best_ber)
-    # np.savetxt(path + "post_ctle_nn_channel_train_loss.txt", history.history["loss"], fmt="%1.7e")
-    # np.savetxt(path + "post_ctle_nn_channel_val_loss.txt", history.history["val_loss"], fmt="%1.7e")
 
     # Legacy four-parameter CTLELayer4 decoder is not valid for v12_v4.
 
-model = tf.keras.models.load_model(
+model = load_saved_model(
     model_file,
     custom_objects={
         "CTLELayer2": CTLELayer2,
@@ -498,7 +515,6 @@ model = tf.keras.models.load_model(
         "channel_take_center": channel_take_center,
         "channel_restore_waveform": channel_restore_waveform,
     },
-    safe_mode=False,
 )
 constellation_raw = np.array([-3.0, -1.0, 1.0, 3.0], dtype=np.float32)
 constellation_norm = constellation_raw / train_rms
@@ -536,6 +552,6 @@ report_experiment_result(
 )
 
 tf.random.set_seed(SEED)
-save_before_downsample_probe(model, x_train, "train")
+# save_before_downsample_probe(model, x_train, "train")
 tf.random.set_seed(SEED + 1)
-save_before_downsample_probe(model, x_test, "test")
+# save_before_downsample_probe(model, x_test, "test")

@@ -484,9 +484,20 @@ class CTLELayer4(tf.keras.layers.Layer):
             raise ValueError("CTLELayer4 expects input shape [batch, time, 1] or [batch, time]")
 
         x = tf.cast(x, tf.float32)
+        b, a, _, _ = self.digital_iir_coefficients()
+        b0, b1, b2 = tf.unstack(b)
+        _, a1, a2 = tf.unstack(a)
+        y = self._iir2(x, b0, b1, b2, a1, a2)
+
+        if input_rank == 3:
+            return y[:, :, tf.newaxis]
+        return y
+
+    def digital_iir_coefficients(self):
+        """Expose the filtering coefficients for link group-delay analysis."""
         tau_z, tau_p1, tau_p2, A0 = self._prewarped_params()
 
-        Fs = tf.constant(self.Fs, dtype=x.dtype)
+        Fs = tf.cast(self.Fs, tau_z.dtype)
         K = 2.0 * Fs
 
         b0 = A0 * (tau_z * K + 1.0)
@@ -506,11 +517,9 @@ class CTLELayer4(tf.keras.layers.Layer):
         a1 = a1 / a0
         a2 = a2 / a0
 
-        y = self._iir2(x, b0, b1, b2, a1, a2)
-
-        if input_rank == 3:
-            return y[:, :, tf.newaxis]
-        return y
+        # This CTLE has only a biquad; the extra section is an identity.
+        identity = tf.ones([1], dtype=tau_z.dtype)
+        return tf.stack([b0, b1, b2]), tf.stack([tf.ones_like(a1), a1, a2]), identity, identity
 
     def _target_params(self):
         tau_z = tf.exp(self.log_tau_z)
