@@ -1,0 +1,4 @@
+snr_db,stages,old_offset,new_offset,old_val_mse,new_val_mse,old_val_ber,new_val_ber,elapsed_seconds,new_model_file,new_log_file
+10,1,2,2,0.071712546,0.071752816,0.042724609,0.042907715,43.484,D:\git_CTLE\CTLE_v2\model\model_trained\pw_post_ctle_nn_channel_snr10_u_model.keras,D:\git_CTLE\CTLE_v2\model\result\post_stage_u_compare\pw_post_ctle_nn_channel_snr10_u.log
+10,4,3,3,0.060680501,0.067083552,0.030151367,0.036590576,84.813,D:\git_CTLE\CTLE_v2\model\model_trained\pw_post_4stage_ctle_nn_channel_snr10_u_model.keras,D:\git_CTLE\CTLE_v2\model\result\post_stage_u_compare\pw_post_4stage_ctle_nn_channel_snr10_u.log
+10,6,3,3,0.061938006,0.070541844,0.032470703,0.042053223,72.266,D:\git_CTLE\CTLE_v2\model\model_trained\pw_post_6stage_ctle_nn_channel_snr10_u_model.keras,D:\git_CTLE\CTLE_v2\model\result\post_stage_u_compare\pw_post_6stage_ctle_nn_channel_snr10_u.log

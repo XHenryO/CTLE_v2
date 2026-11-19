@@ -182,10 +182,10 @@ ratio = 0.8
 Rs = 25e9
 sps = 4
 Fs = Rs * sps
-snr = 15
+snr = configured_snr(10)
 snr_tag = "snr" + str(snr)
 offset_candidates = list(range(sps))
-ffe_kernel_size = 17    #17  13 9 7 5
+ffe_kernel_size = 9    #17  13 9 7 5
 tap_tag = "tap" + str(ffe_kernel_size)
 # Resolve inputs and outputs independently of the launch directory.
 output_root = os.path.dirname(os.path.abspath(__file__))

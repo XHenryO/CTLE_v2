@@ -237,6 +237,92 @@ class CTLELayer(tf.keras.layers.Layer):
         return config
 
 
+@tf.keras.utils.register_keras_serializable(package="CTLE")
+class CTLELayer_u(CTLELayer):
+    """CTLE with smooth, always-valid frequency and gain parameters.
+
+    Trainable ``u`` variables are dimensionless coordinates, not frequencies.
+    Their forward mapping is also the mapping differentiated by TensorFlow.
+    The transfer function and FFT behavior are inherited from CTLELayer.
+    """
+
+    ZERO_MIN_FRACTION = 0.01
+    ZERO_MAX_FRACTION = 0.46
+    POLE_MAX_FRACTION = 0.49
+    POLE_ZERO_RATIO = 1.05
+    GAIN_MIN = 1e-6
+    GAIN_MAX = 1e3
+
+    @staticmethod
+    def _inverse_log_interval(value, lower, upper, label):
+        if not np.isfinite(value) or not lower < value < upper:
+            raise ValueError(
+                f"{label}={value} must be strictly between {lower} and {upper}"
+            )
+        fraction = np.log(value / lower) / np.log(upper / lower)
+        return float(np.log(fraction / (1.0 - fraction)))
+
+    def build(self, input_shape):
+        fs = float(self.Fs)
+        if not np.isfinite(fs) or fs <= 0.0:
+            raise ValueError("Fs must be positive and finite")
+        initial_fz = 1.0 / (2.0 * np.pi * self.init_tau_z)
+        initial_fp1 = 1.0 / (2.0 * np.pi * self.init_tau_p1)
+        initial_fp2 = 1.0 / (2.0 * np.pi * self.init_tau_p2)
+        pole_min = self.POLE_ZERO_RATIO * initial_fz
+        initial_values = {
+            "u_z": self._inverse_log_interval(
+                initial_fz, self.ZERO_MIN_FRACTION * fs,
+                self.ZERO_MAX_FRACTION * fs, "init_fz"
+            ),
+            "u_p1": self._inverse_log_interval(
+                initial_fp1, pole_min, self.POLE_MAX_FRACTION * fs, "init_fp1"
+            ),
+            "u_p2": self._inverse_log_interval(
+                initial_fp2, pole_min, self.POLE_MAX_FRACTION * fs, "init_fp2"
+            ),
+            "u_A0": self._inverse_log_interval(
+                self.init_A0, self.GAIN_MIN, self.GAIN_MAX, "init_A0"
+            ),
+        }
+        for name, initial in initial_values.items():
+            setattr(self, name, self.add_weight(
+                name=name, shape=(),
+                initializer=tf.keras.initializers.Constant(initial),
+                trainable=True,
+            ))
+        tf.keras.layers.Layer.build(self, input_shape)
+
+    @staticmethod
+    def _log_interval(raw, lower, upper):
+        lower = tf.cast(lower, raw.dtype)
+        upper = tf.cast(upper, raw.dtype)
+        return tf.exp(
+            tf.math.log(lower)
+            + tf.sigmoid(raw) * (tf.math.log(upper) - tf.math.log(lower))
+        )
+
+    def frequencies_and_gain(self):
+        """Return the effective zero, poles (Hz), and DC gain."""
+        fs = tf.cast(self.Fs, self.u_z.dtype)
+        fz = self._log_interval(
+            self.u_z, self.ZERO_MIN_FRACTION * fs,
+            self.ZERO_MAX_FRACTION * fs,
+        )
+        pole_min = self.POLE_ZERO_RATIO * fz
+        pole_max = self.POLE_MAX_FRACTION * fs
+        fp1 = self._log_interval(self.u_p1, pole_min, pole_max)
+        fp2 = self._log_interval(self.u_p2, pole_min, pole_max)
+        A0 = self._log_interval(self.u_A0, self.GAIN_MIN, self.GAIN_MAX)
+        return fz, fp1, fp2, A0
+
+    def _params(self):
+        fz, fp1, fp2, A0 = self.frequencies_and_gain()
+        two_pi = tf.cast(2.0 * np.pi, fz.dtype)
+        return 1.0 / (two_pi * fz), 1.0 / (two_pi * fp1), \
+            1.0 / (two_pi * fp2), A0
+
+
 class CTLEBlendLayer(CTLELayer):
     def __init__(self, init_alpha=0.0, **kwargs):
         super().__init__(**kwargs)
@@ -2273,4 +2359,236 @@ class CTLELayer_model_v12_v4(CTLELayer_model_v12_v3):
         config.update({
             "prewarp_frequency_hz": self.prewarp_frequency_hz,
         })
+        return config
+
+
+@tf.keras.utils.register_keras_serializable(package="CTLE")
+class Layer_perfect(tf.keras.layers.Layer):
+    """Train an unconstrained complex equalizer at frequency control points.
+
+    Control points cover 0 to Fs/2. Their real and imaginary parts are
+    interpolated onto the RFFT bins. DC and Nyquist have zero imaginary part
+    so the inverse transform gives a real-valued output.
+    """
+
+    def __init__(self, Fs=200e9, n_points=10000, fft_length=20000, **kwargs):
+        super().__init__(**kwargs)
+        self.Fs = float(Fs)
+        self.n_points = int(n_points)
+        self.fft_length = None if fft_length is None else int(fft_length)
+        if not np.isfinite(self.Fs) or self.Fs <= 0:
+            raise ValueError("Fs must be positive and finite")
+        if self.n_points < 3:
+            raise ValueError("n_points must be at least 3")
+        if self.fft_length is not None and self.fft_length // 2 + 1 < self.n_points:
+            raise ValueError("fft_length must provide at least n_points RFFT bins")
+
+    def build(self, input_shape):
+        self.H_real = self.add_weight(
+            name="H_real",
+            shape=(self.n_points,),
+            initializer=tf.keras.initializers.Ones(),
+            trainable=True,
+        )
+        self.H_imag_interior = self.add_weight(
+            name="H_imag_interior",
+            shape=(self.n_points - 2,),
+            initializer=tf.keras.initializers.Zeros(),
+            trainable=True,
+        )
+        super().build(input_shape)
+
+    def frequency_response(self, fft_length):
+        """Return the complex response on the RFFT grid for fft_length."""
+        n_fft = tf.convert_to_tensor(fft_length, dtype=tf.int32)
+        n_bins = n_fft // 2 + 1
+        position = (
+            tf.cast(tf.range(n_bins), tf.float32)
+            * (self.n_points - 1)
+            * 2.0
+            / tf.cast(n_fft, tf.float32)
+        )
+        left = tf.cast(tf.floor(position), tf.int32)
+        right = tf.minimum(left + 1, self.n_points - 1)
+        fraction = position - tf.cast(left, tf.float32)
+
+        imag_points = tf.concat(
+            [
+                tf.zeros((1,), dtype=self.H_imag_interior.dtype),
+                self.H_imag_interior,
+                tf.zeros((1,), dtype=self.H_imag_interior.dtype),
+            ],
+            axis=0,
+        )
+        real = (
+            (1.0 - fraction) * tf.gather(self.H_real, left)
+            + fraction * tf.gather(self.H_real, right)
+        )
+        imag = (
+            (1.0 - fraction) * tf.gather(imag_points, left)
+            + fraction * tf.gather(imag_points, right)
+        )
+        return tf.complex(real, imag)
+
+    def call(self, inputs, training=None):
+        rank = inputs.shape.rank
+        if rank == 3:
+            x = tf.squeeze(inputs, axis=-1)
+        elif rank == 2:
+            x = inputs
+        else:
+            raise ValueError(
+                "Layer_perfect expects [batch, time] or [batch, time, 1]"
+            )
+
+        x = tf.cast(x, tf.float32)
+        n = tf.shape(x)[1]
+        tf.debugging.assert_greater_equal(
+            n, 2, message="Layer_perfect needs at least two time samples"
+        )
+        n_fft = n if self.fft_length is None else tf.constant(self.fft_length, tf.int32)
+        tf.debugging.assert_less_equal(
+            n, n_fft, message="Layer_perfect input exceeds fft_length"
+        )
+        spectrum = tf.signal.rfft(x, fft_length=[n_fft])
+        response = self.frequency_response(n_fft)
+        y = tf.signal.irfft(
+            spectrum * response[tf.newaxis, :], fft_length=[n_fft]
+        )
+        y = y[:, :n]
+        return y[:, :, tf.newaxis] if rank == 3 else y
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "Fs": self.Fs,
+            "n_points": self.n_points,
+            "fft_length": self.fft_length,
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        # Models saved before fft_length existed used the input length.
+        config.setdefault("fft_length", None)
+        return cls(**config)
+
+    def control_frequencies_hz(self):
+        """Frequency coordinates of the trainable control points."""
+        return np.linspace(0.0, self.Fs / 2.0, self.n_points)
+
+
+@tf.keras.utils.register_keras_serializable(package="CTLE")
+class Layer_spline(tf.keras.layers.Layer):
+    """Minimum-phase equalizer with cubic B-spline log-magnitude.
+
+    Exactly n_controls real coefficients are trained. The spline is defined
+    on a logarithmic frequency axis so low-frequency features get resolution.
+    Frequencies below f_min_hz share the first spline endpoint. Phase is
+    derived from magnitude by minimum-phase real-cepstrum reconstruction;
+    it is not an independent trainable parameter.
+    """
+
+    def __init__(self, Fs=100e9, n_controls=12, fft_length=20000,
+                 f_min_hz=0.1e9, **kwargs):
+        super().__init__(**kwargs)
+        self.Fs = float(Fs)
+        self.n_controls = int(n_controls)
+        self.fft_length = int(fft_length)
+        self.f_min_hz = float(f_min_hz)
+        if not np.isfinite(self.Fs) or self.Fs <= 0:
+            raise ValueError("Fs must be positive and finite")
+        if self.n_controls < 4:
+            raise ValueError("Cubic B-spline needs at least four controls")
+        if self.fft_length < 2 or self.fft_length % 2:
+            raise ValueError("fft_length must be a positive even integer")
+        if not (0 < self.f_min_hz < self.Fs / 2):
+            raise ValueError("f_min_hz must lie between DC and Nyquist")
+
+    @staticmethod
+    def _basis_matrix(frequencies_hz, n_controls, f_min_hz, nyquist_hz):
+        """Open-uniform cubic B-spline basis, evaluated at each RFFT bin."""
+        f = np.maximum(np.asarray(frequencies_hz, dtype=np.float64), f_min_hz)
+        u = np.clip(np.log(f / f_min_hz) / np.log(nyquist_hz / f_min_hz), 0, 1)
+        knots = np.r_[np.zeros(4),
+                      np.linspace(0, 1, n_controls - 2)[1:-1],
+                      np.ones(4)]
+        basis = ((u[:, None] >= knots[:-1]) &
+                 (u[:, None] < knots[1:])).astype(np.float64)
+        for degree in range(1, 4):
+            next_basis = np.zeros((u.size, basis.shape[1] - 1), dtype=np.float64)
+            for j in range(next_basis.shape[1]):
+                left_width = knots[j + degree] - knots[j]
+                right_width = knots[j + degree + 1] - knots[j + 1]
+                if left_width > 0:
+                    next_basis[:, j] += ((u - knots[j]) / left_width) * basis[:, j]
+                if right_width > 0:
+                    next_basis[:, j] += ((knots[j + degree + 1] - u) /
+                                         right_width) * basis[:, j + 1]
+            basis = next_basis
+        basis[u == 1, :] = 0
+        basis[u == 1, -1] = 1
+        return basis.astype(np.float32)
+
+    def build(self, input_shape):
+        self.log_magnitude_controls = self.add_weight(
+            name="log_magnitude_controls",
+            shape=(self.n_controls,),
+            initializer="zeros",  # H(f)=1 before training
+            trainable=True,
+        )
+        frequencies_hz = np.fft.rfftfreq(self.fft_length, 1 / self.Fs)
+        self._basis = tf.constant(self._basis_matrix(
+            frequencies_hz, self.n_controls, self.f_min_hz, self.Fs / 2
+        ))
+        super().build(input_shape)
+
+    def frequency_response(self):
+        log_magnitude = tf.linalg.matvec(self._basis, self.log_magnitude_controls)
+        # Mirror the one-sided log magnitude to a real even full spectrum.
+        # Its inverse FFT is a real cepstrum. Doubling positive quefrencies
+        # and zeroing negative ones yields the minimum-phase log spectrum.
+        full_log_magnitude = tf.concat(
+            [log_magnitude, tf.reverse(log_magnitude[1:-1], axis=[0])], axis=0
+        )
+        # FFT length 20000 is not a power of two; use complex128 here to
+        # preserve the requested magnitude during spectral factorization.
+        cepstrum = tf.math.real(tf.signal.ifft(
+            tf.cast(full_log_magnitude, tf.complex128)
+        ))
+        minimum_phase_cepstrum = tf.concat([
+            cepstrum[:1],
+            2.0 * cepstrum[1:self.fft_length // 2],
+            cepstrum[self.fft_length // 2:self.fft_length // 2 + 1],
+            tf.zeros_like(cepstrum[self.fft_length // 2 + 1:]),
+        ], axis=0)
+        log_response = tf.signal.fft(tf.complex(
+            minimum_phase_cepstrum,
+            tf.zeros_like(minimum_phase_cepstrum),
+        ))
+        return tf.cast(tf.exp(log_response[:self.fft_length // 2 + 1]), tf.complex64)
+
+    def call(self, inputs, training=None):
+        rank = inputs.shape.rank
+        if rank == 3:
+            x = tf.squeeze(inputs, axis=-1)
+        elif rank == 2:
+            x = inputs
+        else:
+            raise ValueError("Layer_spline expects [batch,time] or [batch,time,1]")
+        x = tf.cast(x, tf.float32)
+        n = tf.shape(x)[1]
+        tf.debugging.assert_greater_equal(n, 2)
+        tf.debugging.assert_less_equal(n, self.fft_length)
+        spectrum = tf.signal.rfft(x, fft_length=[self.fft_length])
+        response = self.frequency_response()
+        y = tf.signal.irfft(spectrum * response[tf.newaxis, :],
+                            fft_length=[self.fft_length])[:, :n]
+        return y[:, :, tf.newaxis] if rank == 3 else y
+
+    def get_config(self):
+        config = super().get_config()
+        config.update({"Fs": self.Fs, "n_controls": self.n_controls,
+                       "fft_length": self.fft_length,
+                       "f_min_hz": self.f_min_hz})
         return config

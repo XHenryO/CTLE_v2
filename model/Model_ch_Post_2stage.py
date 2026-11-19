@@ -14,11 +14,15 @@ from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLRO
 from tensorflow.keras.layers import Input, Lambda
 from tensorflow.keras.models import Model
 
-from Layer import CTLELayer, FixedFIRChannelLayer, NormalizeRMSLayer, CTLELayer2, CTLELayer3, CTLELayer4, \
+from Layer import CTLELayer, CTLELayer_u, FixedFIRChannelLayer, NormalizeRMSLayer, CTLELayer2, CTLELayer3, CTLELayer4, \
     CTLELayer_model, CTLELayer_model2, CTLELayer_model_v12, CTLELayer_model_v12_v2, \
     CTLELayer_model_v12_v3, CTLELayer_model_v12_v4
 from equalizer_group_delay import print_maximum_link_group_delay
 from experiment_reporting import configured_retrain, configured_snr, report_experiment_result
+from post_ctle_stage_config import (
+    cascaded_ctle_learning_rate, ctle_stage_initialization,
+    print_trained_ctle_stages,
+)
 
 # from Layer_tau import CTLELayer
 
@@ -235,7 +239,7 @@ ratio = 0.8
 Rs = 25e9
 sps = 4
 Fs = Rs * sps
-snr = 10
+snr = configured_snr(10)
 snr_tag = "snr" + str(snr)
 offset_candidates = list(range(sps))
 # Resolve inputs and outputs independently of the launch directory.
@@ -244,7 +248,7 @@ name_Tx = os.path.join(os.path.dirname(output_root), "data", "Txdata.txt")
 channel_file = os.path.join(output_root, "channel", "DNN_channelest_TTHNet_SinM.h5")
 channel_in_taps = 157
 channel_output_dim = 85
-experiment_name = "pw_post_2stage_ctle_nn_channel_" + snr_tag
+experiment_name = "pw_post_2stage_ctle_nn_channel_" + snr_tag + "_u"
 models_dir = os.path.join(output_root, "model_trained")
 offset_models_dir = os.path.join(models_dir, experiment_name + "_offsets")
 weights_dir = os.path.join(output_root, "model_weights", experiment_name)
@@ -323,14 +327,16 @@ def build_model(current_offset, use_vm_ctle=False):
     #     name="rx_ctle",
     # )(data_ch)
     # 原来的零极点 CTLE 调用暂时停用；需要恢复时取消下面这段注释。
-    data_CTLE = CTLELayer(
+    data_CTLE = CTLELayer_u(
         Fs=Fs,
         name="rx_ctle",
+        **ctle_stage_initialization(Fs, 1),
     )(data_ch)
 
-    data_CTLE2 = CTLELayer(
+    data_CTLE2 = CTLELayer_u(
         Fs=Fs,
         name="rx_ctle_stage2",
+        **ctle_stage_initialization(Fs, 2),
     )(data_CTLE)
 
     # v12 physical IIR CTLE with prewarped Tustin discretization.
@@ -364,7 +370,8 @@ def build_model(current_offset, use_vm_ctle=False):
 
     model = Model(inputs=NNinput, outputs=data_symbol, name="post_equalization_ctle")
     model.compile(loss='mse',
-                  optimizer=tf.keras.optimizers.Adam(learning_rate=5e-2),
+                  optimizer=tf.keras.optimizers.Adam(
+                      learning_rate=cascaded_ctle_learning_rate(2)),
                   metrics=['mse'])
     return model
 
@@ -439,6 +446,7 @@ if retrain:
         best_model_file,
         custom_objects={
             "CTLELayer": CTLELayer,
+            "CTLELayer_u": CTLELayer_u,
             "CTLELayer2": CTLELayer2,
             "CTLELayer3": CTLELayer3,
             "CTLELayer4": CTLELayer4,
@@ -475,11 +483,11 @@ if retrain:
     print("best offset =", best_offset, "best val MSE =", best_mse, "best val BER =", best_ber)
 
 if VM == 0:
-    print_ctle_weights(final_weights_file)
     model = load_saved_model(
         model_file,
         custom_objects={
             "CTLELayer": CTLELayer,
+            "CTLELayer_u": CTLELayer_u,
             "CTLELayer2": CTLELayer2,
             "CTLELayer3": CTLELayer3,
             "CTLELayer4": CTLELayer4,
@@ -505,6 +513,7 @@ if VM == 0:
             "channel_restore_waveform": channel_restore_waveform,
         },
     )
+    print_trained_ctle_stages(model, 2)
     print("VM = 0, load trained model:", model_file)
 else:
     model = build_model(vm_offset, use_vm_ctle=True)
